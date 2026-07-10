@@ -1350,22 +1350,6 @@ class AgentActivity(RecognitionHooks):
                     )
                 resolved_tools.append(tool)
 
-        # if tool has the IGNORE_ON_ENTER flag, every generate_reply inside on_enter will ignore it
-        if on_enter_data := _OnEnterContextVar.get(None):
-            if on_enter_data.agent == self._agent and on_enter_data.session == self._session:
-                filtered_tools: list[llm.Tool | llm.Toolset] = []
-                to_filter = resolved_tools if is_given(resolved_tools) else all_tools
-                for tool in to_filter:
-                    if (
-                        isinstance(tool, llm.RawFunctionTool | llm.FunctionTool)
-                        and tool.info.flags & ToolFlag.IGNORE_ON_ENTER
-                    ):
-                        continue
-
-                    # TODO(long): add IGNORE_ON_ENTER to ToolSet?
-                    filtered_tools.append(tool)
-                to_filter[:] = filtered_tools
-
         handle = SpeechHandle.create(
             allow_interruptions=allow_interruptions
             if is_given(allow_interruptions)
@@ -1382,7 +1366,7 @@ class AgentActivity(RecognitionHooks):
                 self._realtime_reply_task(
                     speech_handle=handle,
                     # TODO(theomonnom): support llm.ChatMessage for the realtime model
-                    user_input=user_message.text_content if user_message else None,
+                    user_input=user_message.raw_text_content if user_message else None,
                     instructions=self._render_realtime_instructions(instructions)
                     if instructions
                     else None,
@@ -2291,7 +2275,7 @@ class AgentActivity(RecognitionHooks):
             # make sure the on_user_turn_completed didn't change some request parameters
             # otherwise invalidate the preemptive generation
             if (
-                preemptive.info.new_transcript == user_message.text_content
+                preemptive.info.new_transcript == user_message.raw_text_content
                 and preemptive.chat_ctx.is_equivalent(temp_mutable_chat_ctx)
                 and preemptive.tools == self.tools
                 and preemptive.tool_choice == self._tool_choice
@@ -2441,7 +2425,10 @@ class AgentActivity(RecognitionHooks):
         return instructions
 
     def _resolve_expressive_options(self) -> ExpressiveOptions | None:
-        """Resolve expressive from agent (overrides session). Returns None if disabled.
+        """Resolve the session's internal expressive setting. Returns None if disabled.
+
+        Expressive mode is framework-internal and not publicly exposed; the session
+        hardcodes it to ``False``, so this currently always returns ``None``.
 
         Expressive mode requires two things:
         - the inference gateway TTS (``livekit.agents.inference.TTS``): the markup
@@ -2459,9 +2446,7 @@ class AgentActivity(RecognitionHooks):
         if not isinstance(self.tts, inference.TTS) or self.tts.markup.llm_instructions() is None:
             return None
 
-        expr = self._agent.expressive
-        if not utils.is_given(expr):
-            expr = self._session.options.expressive
+        expr = self._session._expressive
         if isinstance(expr, dict):
             # a `preset` selector resolves to the active TTS provider's tuned preset
             # (falling back to the agnostic default); explicit fields override on top
@@ -2744,6 +2729,22 @@ class AgentActivity(RecognitionHooks):
         if audio_out is not None and not audio_out.first_frame_fut.done():
             audio_out.first_frame_fut.cancel()
 
+    def _on_enter_ignored_tools(self, tool_ctx: llm.ToolContext) -> list[llm.Tool]:
+        """Tools flagged IGNORE_ON_ENTER, when this reply runs inside on_enter."""
+        on_enter_data = _OnEnterContextVar.get(None)
+        if (
+            on_enter_data is None
+            or on_enter_data.agent != self._agent
+            or on_enter_data.session != self._session
+        ):
+            return []
+        return [
+            tool
+            for tool in tool_ctx.flatten()
+            if isinstance(tool, llm.RawFunctionTool | llm.FunctionTool)
+            and tool.info.flags & ToolFlag.IGNORE_ON_ENTER
+        ]
+
     @utils.log_exceptions(logger=logger)
     async def _pipeline_reply_task(
         self,
@@ -2801,7 +2802,9 @@ class AgentActivity(RecognitionHooks):
             )
             current_span.set_attribute(trace_types.ATTR_INSTRUCTIONS, instr_trace)
         if new_message:
-            current_span.set_attribute(trace_types.ATTR_USER_INPUT, new_message.text_content or "")
+            current_span.set_attribute(
+                trace_types.ATTR_USER_INPUT, new_message.raw_text_content or ""
+            )
 
         if (room_io := self._session._room_io) and room_io.room.isconnected():
             _set_participant_attributes(current_span, room_io.room.local_participant)
@@ -2814,6 +2817,7 @@ class AgentActivity(RecognitionHooks):
         )
         chat_ctx = chat_ctx.copy()
         tool_ctx = llm.ToolContext(tools)
+        tool_ctx._exclude(self._on_enter_ignored_tools(tool_ctx))
 
         if new_message is not None:
             chat_ctx.insert(new_message)
@@ -3382,6 +3386,14 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx._upsert_item(msg)
             self._session._conversation_item_added(msg)
 
+        # inside on_enter, hide flagged tools even when no tools= was passed (fall back to self.tools)
+        turn_tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN
+        tool_ctx = llm.ToolContext(tools if tools is not None else self.tools)
+        on_enter_ignored = self._on_enter_ignored_tools(tool_ctx)
+        if tools is not None or on_enter_ignored:
+            tool_ctx._exclude(on_enter_ignored)
+            turn_tools = tool_ctx.flatten()
+
         ori_tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN
         ori_tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN
         try:
@@ -3397,18 +3409,14 @@ class AgentActivity(RecognitionHooks):
                     ori_tool_choice = self._tool_choice
                     self._rt_session.update_options(tool_choice=model_settings.tool_choice)
 
-                if tools is not None:
+                if is_given(turn_tools):
                     ori_tools = self._rt_session.tools.flatten()
-                    await self._rt_session.update_tools(llm.ToolContext(tools).flatten())
+                    await self._rt_session.update_tools(turn_tools)
 
             generate_reply_fut = self._rt_session.generate_reply(
                 instructions=instructions or NOT_GIVEN,
                 tool_choice=(model_settings.tool_choice if per_response_tool_choice else NOT_GIVEN),
-                tools=(
-                    llm.ToolContext(tools).flatten()
-                    if per_response_tool_choice and tools is not None
-                    else NOT_GIVEN
-                ),
+                tools=(turn_tools if per_response_tool_choice else NOT_GIVEN),
             )
             await speech_handle.wait_if_not_interrupted([generate_reply_fut])
             if speech_handle.interrupted:
