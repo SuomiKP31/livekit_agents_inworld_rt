@@ -18,7 +18,6 @@ See https://docs.livekit.io/agents/integrations/tts/inworld/ and
 https://docs.livekit.io/agents/models/stt/inworld/ for more information.
 """
 
-from . import realtime
 from .stt import STT, SpeechStream
 from .tts import (
     TTS,
@@ -43,7 +42,6 @@ __all__ = [
     "TTSModels",
     "TextNormalization",
     "TimestampType",
-    "realtime",
     "__version__",
 ]
 
